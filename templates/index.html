@@ -1,0 +1,134 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>Lyrics Transcriber</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <style>
+    :root { --bg: #0f1115; --panel: #161a22; --accent: #6c8cff; --text: #e6e8ee; --muted: #9aa3b2; }
+    * { box-sizing: border-box; }
+    body { margin: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+           background: var(--bg); color: var(--text); }
+    .wrap { max-width: 880px; margin: 40px auto; padding: 0 20px; }
+    h1 { margin: 0 0 6px; font-size: 24px; }
+    .sub { color: var(--muted); margin-bottom: 24px; font-size: 14px; }
+    .card { background: var(--panel); border: 1px solid #232936; border-radius: 12px; padding: 20px; }
+    label { display: block; margin: 12px 0 6px; font-size: 13px; color: var(--muted); }
+    input[type=text], select { width: 100%; padding: 10px 12px; background: #0c0f15; color: var(--text);
+                               border: 1px solid #2a3242; border-radius: 8px; font-size: 14px; }
+    .row { display: flex; gap: 16px; flex-wrap: wrap; }
+    .row > div { flex: 1 1 220px; }
+    .checks { display: flex; gap: 18px; margin-top: 8px; font-size: 14px; color: var(--text); }
+    .checks label { color: var(--text); margin: 0; display: flex; align-items: center; gap: 8px; }
+    button { margin-top: 18px; padding: 12px 18px; background: var(--accent); color: #fff;
+             border: 0; border-radius: 8px; font-size: 15px; cursor: pointer; }
+    button:disabled { opacity: 0.6; cursor: not-allowed; }
+    pre { background: #0c0f15; border: 1px solid #2a3242; padding: 14px; border-radius: 8px;
+          overflow-x: auto; font-size: 13px; }
+    .meta { font-size: 13px; color: var(--muted); margin: 12px 0 6px; }
+    .seg { padding: 8px 0; border-bottom: 1px dashed #2a3242; }
+    .seg .ts { color: var(--muted); font-variant-numeric: tabular-nums; margin-right: 8px; }
+    .status { font-size: 13px; color: var(--muted); margin-top: 10px; }
+    .err { color: #ff7474; }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <h1>Lyrics Transcriber</h1>
+    <div class="sub">faster-whisper · model: <code>{{ model }}</code> · device: <code>{{ device }}</code></div>
+
+    <div class="card">
+      <form id="form">
+        <label for="audio">Audio file (mp3, wav, flac, m4a, ogg, opus, ...)</label>
+        <input id="audio" name="audio" type="file" accept="audio/*" required />
+
+        <div class="row">
+          <div>
+            <label for="language">Language (leave blank to auto-detect)</label>
+            <input id="language" name="language" type="text" placeholder="en, hi, es, ..." />
+          </div>
+          <div>
+            <label for="prompt">Optional initial prompt</label>
+            <input id="prompt" name="initial_prompt" type="text" placeholder="e.g. song lyrics, artist name" />
+          </div>
+        </div>
+
+        <div class="checks">
+          <label><input type="checkbox" name="vad_filter" checked /> VAD filter</label>
+          <label><input type="checkbox" name="word_timestamps" /> Word-level timestamps</label>
+        </div>
+
+        <button id="go" type="submit">Transcribe</button>
+        <div id="status" class="status"></div>
+      </form>
+    </div>
+
+    <div id="result" class="card" style="margin-top: 20px; display:none;">
+      <div id="meta" class="meta"></div>
+      <h3 style="margin: 8px 0;">Full text</h3>
+      <pre id="text"></pre>
+      <h3 style="margin: 18px 0 8px;">Segments</h3>
+      <div id="segments"></div>
+    </div>
+  </div>
+
+  <script>
+    const form = document.getElementById("form");
+    const statusEl = document.getElementById("status");
+    const resultEl = document.getElementById("result");
+    const metaEl = document.getElementById("meta");
+    const textEl = document.getElementById("text");
+    const segmentsEl = document.getElementById("segments");
+    const goBtn = document.getElementById("go");
+
+    function fmt(t) {
+      const m = Math.floor(t / 60);
+      const s = (t % 60).toFixed(2).padStart(5, "0");
+      return `${m}:${s}`;
+    }
+
+    form.addEventListener("submit", async (e) => {
+      e.preventDefault();
+      const fd = new FormData();
+      const audio = document.getElementById("audio").files[0];
+      if (!audio) return;
+      fd.append("audio", audio);
+      fd.append("language", document.getElementById("language").value);
+      fd.append("initial_prompt", document.getElementById("prompt").value);
+      fd.append("vad_filter", form.vad_filter.checked ? "true" : "false");
+      fd.append("word_timestamps", form.word_timestamps.checked ? "true" : "false");
+
+      goBtn.disabled = true;
+      statusEl.textContent = "Transcribing... (first request may load the model)";
+      statusEl.className = "status";
+      resultEl.style.display = "none";
+
+      const t0 = performance.now();
+      try {
+        const res = await fetch("/transcribe", { method: "POST", body: fd });
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
+
+        const elapsed = ((performance.now() - t0) / 1000).toFixed(2);
+        metaEl.textContent = `language=${data.language} (p=${data.language_probability}) · duration=${data.duration}s · request=${elapsed}s`;
+        textEl.textContent = data.text;
+
+        segmentsEl.innerHTML = "";
+        for (const seg of data.segments) {
+          const div = document.createElement("div");
+          div.className = "seg";
+          div.innerHTML = `<span class="ts">[${fmt(seg.start)} → ${fmt(seg.end)}]</span>${seg.text.replace(/</g, "&lt;")}`;
+          segmentsEl.appendChild(div);
+        }
+        resultEl.style.display = "block";
+        statusEl.textContent = "Done.";
+      } catch (err) {
+        statusEl.textContent = "Error: " + err.message;
+        statusEl.className = "status err";
+      } finally {
+        goBtn.disabled = false;
+      }
+    });
+  </script>
+</body>
+</html>
