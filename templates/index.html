@@ -80,6 +80,17 @@
       <pre id="text"></pre>
       <h3 style="margin: 18px 0 8px;">Segments</h3>
       <div id="segments"></div>
+
+      <h3 style="margin: 22px 0 8px;">Correct lyrics with Nova</h3>
+      <div class="row">
+        <div>
+          <label for="song_name">Song name (add the artist for better results)</label>
+          <input id="song_name" type="text" placeholder="e.g. Bohemian Rhapsody — Queen" />
+        </div>
+      </div>
+      <button id="correctBtn" type="button">Correct lyrics</button>
+      <div id="correctStatus" class="status"></div>
+      <pre id="corrected" style="display:none;"></pre>
     </div>
   </div>
 
@@ -91,6 +102,9 @@
     const textEl = document.getElementById("text");
     const segmentsEl = document.getElementById("segments");
     const goBtn = document.getElementById("go");
+    const correctBtn = document.getElementById("correctBtn");
+    const correctStatusEl = document.getElementById("correctStatus");
+    const correctedEl = document.getElementById("corrected");
 
     function fmt(t) {
       const m = Math.floor(t / 60);
@@ -138,11 +152,48 @@
         }
         resultEl.style.display = "block";
         statusEl.textContent = "Done.";
+        correctedEl.style.display = "none";
+        correctStatusEl.textContent = "";
       } catch (err) {
         statusEl.textContent = "Error: " + err.message;
         statusEl.className = "status err";
       } finally {
         goBtn.disabled = false;
+      }
+    });
+
+    correctBtn.addEventListener("click", async () => {
+      const lyrics = textEl.textContent.trim();
+      if (!lyrics) {
+        correctStatusEl.textContent = "Nothing to correct yet — transcribe first.";
+        correctStatusEl.className = "status err";
+        return;
+      }
+      const songName = document.getElementById("song_name").value;
+
+      correctBtn.disabled = true;
+      correctStatusEl.textContent = "Correcting with Nova...";
+      correctStatusEl.className = "status";
+
+      const t0 = performance.now();
+      try {
+        const res = await fetch("/correct", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ song_name: songName, lyrics }),
+        });
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
+
+        const elapsed = ((performance.now() - t0) / 1000).toFixed(2);
+        correctedEl.textContent = data.corrected;
+        correctedEl.style.display = "block";
+        correctStatusEl.textContent = `Done (model=${data.model}, ${elapsed}s).`;
+      } catch (err) {
+        correctStatusEl.textContent = "Error: " + err.message;
+        correctStatusEl.className = "status err";
+      } finally {
+        correctBtn.disabled = false;
       }
     });
   </script>

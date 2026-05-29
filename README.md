@@ -94,6 +94,10 @@ Open `http://<ec2-public-ip>:8000/` (make sure the security group lets port
 | `GUNICORN_WORKERS`      | `1`          | keep at 1 unless you have VRAM for multiple model copies       |
 | `GUNICORN_THREADS`      | `4`          | concurrent requests per worker                                 |
 | `GUNICORN_TIMEOUT`      | `600`        | seconds; long enough for big files                             |
+| `AWS_REGION`            | `us-east-1`  | region for Bedrock (lyric correction)                          |
+| `NOVA_MODEL_ID`         | `amazon.nova-pro-v1:0` | Bedrock Nova model id for `/correct` (`nova-lite`, `nova-micro`, ...) |
+| `NOVA_MAX_TOKENS`       | `4096`       | max output tokens for correction                               |
+| `NOVA_TEMPERATURE`      | `0.2`        | sampling temperature for correction                            |
 
 ## API
 
@@ -148,6 +152,44 @@ Response:
   "text": "...",
   "segments": [
     { "id": 0, "start": 0.0, "end": 5.2, "text": "...", "words": [ ... ] }
+  ]
+}
+```
+
+### `POST /correct`
+
+Cleans up transcribed lyrics with an Amazon Bedrock **Nova** model. The
+browser UI shows a **Correct lyrics** button (with a song-name field) after a
+transcription; it sends the full text here and displays the corrected result.
+
+Accepts JSON (or form fields):
+
+| Field       | Required | Description                                   |
+| ----------- | -------- | --------------------------------------------- |
+| `lyrics`    | yes      | the transcribed text to correct               |
+| `song_name` | no       | song title (and artist) to guide corrections  |
+
+```bash
+curl -X POST http://<ec2-public-ip>:8000/correct \
+     -H "Content-Type: application/json" \
+     -d '{"song_name": "Bohemian Rhapsody — Queen", "lyrics": "is this the real life..."}'
+```
+
+Response: `{ "song_name": "...", "model": "amazon.nova-pro-v1:0", "corrected": "..." }`
+
+**AWS setup:** the app uses the standard boto3 credential chain — on EC2 give
+the instance role permission to call Bedrock and enable model access for Nova
+in the Bedrock console (region must match `AWS_REGION`). Minimal IAM policy:
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": "bedrock:InvokeModel",
+      "Resource": "arn:aws:bedrock:*::foundation-model/amazon.nova-*"
+    }
   ]
 }
 ```

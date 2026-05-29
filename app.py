@@ -41,6 +41,14 @@ SAMPLE_RATE = 16000
 # Structure labels treated as non-vocal and skipped when segment ranges given.
 DEFAULT_SKIP_LABELS = {"silence"}
 
+# Amazon Bedrock (Nova) settings for lyric correction.
+AWS_REGION = os.environ.get("AWS_REGION") or os.environ.get(
+    "AWS_DEFAULT_REGION", "us-east-1"
+)
+NOVA_MODEL_ID = os.environ.get("NOVA_MODEL_ID", "amazon.nova-pro-v1:0")
+NOVA_MAX_TOKENS = int(os.environ.get("NOVA_MAX_TOKENS", "4096"))
+NOVA_TEMPERATURE = float(os.environ.get("NOVA_TEMPERATURE", "0.2"))
+
 MAX_UPLOAD_MB = int(os.environ.get("MAX_UPLOAD_MB", "200"))
 ALLOWED_EXTENSIONS = {
     "mp3", "wav", "flac", "ogg", "m4a", "aac", "opus", "webm", "mp4", "wma",
@@ -58,6 +66,9 @@ _model: Optional[WhisperModel] = None
 _batched_model: Optional[BatchedInferencePipeline] = None
 # faster-whisper's transcribe is not guaranteed thread-safe; serialize requests.
 _transcribe_lock = threading.Lock()
+
+_bedrock_lock = threading.Lock()
+_bedrock_client = None  # boto3 bedrock-runtime client, created lazily
 
 
 def get_model() -> tuple[WhisperModel, Optional[BatchedInferencePipeline]]:
@@ -79,6 +90,76 @@ def get_model() -> tuple[WhisperModel, Optional[BatchedInferencePipeline]]:
                     _batched_model = BatchedInferencePipeline(model=_model)
                 logger.info("Model loaded.")
     return _model, _batched_model
+
+
+def get_bedrock():
+    """Lazily create a thread-safe Bedrock runtime client (boto3).
+
+    Uses the standard AWS credential chain (env vars, shared config, or the
+    EC2 instance role), so no secrets live in this app.
+    """
+    global _bedrock_client
+    if _bedrock_client is None:
+        with _bedrock_lock:
+            if _bedrock_client is None:
+                import boto3  # imported lazily so transcription works without it
+
+                logger.info(
+                    "Creating Bedrock client (region=%s, model=%s)",
+                    AWS_REGION, NOVA_MODEL_ID,
+                )
+                _bedrock_client = boto3.client(
+                    "bedrock-runtime", region_name=AWS_REGION
+                )
+    return _bedrock_client
+
+
+CORRECTION_SYSTEM_PROMPT = (
+    "You are an expert music lyrics editor. You will be given the raw output of "
+    "an automatic speech-to-text system applied to a song. That transcription "
+    "often contains misheard words, run-on lines, missing words, and "
+    "duplicated phrases. Your job is to produce the correct, clean lyrics.\n\n"
+    "Rules:\n"
+    "- Use your knowledge of the named song (and artist, if given) to fix "
+    "misheard words and restore the real lyrics.\n"
+    "- Keep the original language; do not translate.\n"
+    "- Fix line breaks so each line is a natural lyric line. Group lines into "
+    "verses/chorus with blank lines where appropriate.\n"
+    "- Remove obvious ASR artifacts and accidental repetitions.\n"
+    "- Do not invent whole sections that are not supported by the transcription "
+    "unless you are confident they are the song's actual lyrics.\n"
+    "- Return ONLY the corrected lyrics as plain text. No preamble, no "
+    "explanations, no markdown fences."
+)
+
+
+def correct_lyrics_with_nova(song_name: str, lyrics: str) -> str:
+    """Send transcribed lyrics to a Bedrock Nova model and return corrected text."""
+    client = get_bedrock()
+
+    song_line = (
+        f'Song: "{song_name}".' if song_name else "Song title: (unknown)."
+    )
+    user_text = (
+        f"{song_line}\n\n"
+        "Here is the raw speech-to-text transcription of the lyrics. "
+        "Correct it per your instructions and return only the corrected "
+        "lyrics:\n\n"
+        f"{lyrics}"
+    )
+
+    response = client.converse(
+        modelId=NOVA_MODEL_ID,
+        system=[{"text": CORRECTION_SYSTEM_PROMPT}],
+        messages=[{"role": "user", "content": [{"text": user_text}]}],
+        inferenceConfig={
+            "maxTokens": NOVA_MAX_TOKENS,
+            "temperature": NOVA_TEMPERATURE,
+        },
+    )
+
+    parts = response["output"]["message"]["content"]
+    return "".join(p.get("text", "") for p in parts).strip()
 
 
 # ---------------------------------------------------------------------------
@@ -365,6 +446,35 @@ def transcribe():
             tmp_path.unlink(missing_ok=True)
         except Exception:
             logger.warning("Could not remove temp file %s", tmp_path)
+
+
+@app.route("/correct", methods=["POST"])
+def correct():
+    """Correct transcribed lyrics with a Bedrock Nova model.
+
+    Accepts JSON or form fields: `song_name` (optional) and `lyrics` (required).
+    """
+    data = request.get_json(silent=True) or request.form
+    song_name = (data.get("song_name") or "").strip()
+    lyrics = (data.get("lyrics") or "").strip()
+
+    if not lyrics:
+        return jsonify({"error": "No 'lyrics' provided to correct."}), 400
+
+    try:
+        logger.info(
+            "Correcting lyrics with Nova (song=%r, chars=%d, model=%s)",
+            song_name, len(lyrics), NOVA_MODEL_ID,
+        )
+        corrected = correct_lyrics_with_nova(song_name, lyrics)
+        return jsonify({
+            "song_name": song_name,
+            "model": NOVA_MODEL_ID,
+            "corrected": corrected,
+        })
+    except Exception as e:
+        logger.exception("Lyric correction failed")
+        return jsonify({"error": str(e)}), 500
 
 
 @app.errorhandler(413)
