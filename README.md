@@ -108,6 +108,26 @@ multipart/form-data fields:
 | `word_timestamps` | no       | `true` / `false` (default `false`)                |
 | `vad_filter`      | no       | `true` / `false` (default `true`)                 |
 | `initial_prompt`  | no       | free-text prompt to bias decoding                 |
+| `segments`        | no       | JSON of structure segments; transcribe only these ranges (overrides VAD) |
+| `skip_labels`     | no       | comma-separated labels to drop from `segments` (default `silence`) |
+
+#### Structure-segment mode (instead of VAD)
+
+If you already have a music-structure analysis (e.g. from
+[allin1](https://github.com/mir-aidata/all-in-one)), pass it as `segments` to
+transcribe each labeled section directly and skip the parts you don't want
+(`silence` by default). This is usually more reliable than VAD for music: no
+sung phrases get dropped by a speech-tuned detector. Accepted shapes: a raw
+list, an object with a `segments` key, or any nested JSON containing such a
+list. Returned timestamps are absolute (offset back into the original audio),
+and adjacent kept ranges are merged so Whisper keeps context.
+
+```bash
+curl -F "audio=@song.mp3" -F "language=en" \
+     -F 'segments={"segments":[{"start":0.0,"end":127.08,"label":"verse"},{"start":216.0,"end":220.4,"label":"silence"}]}' \
+     -F "skip_labels=silence" \
+     http://<ec2-public-ip>:8000/transcribe
+```
 
 Example:
 
@@ -138,6 +158,9 @@ Response:
   layered harmonies can hurt accuracy. For best results, run the audio
   through a vocal-isolation tool (e.g. Demucs) first.
 - `vad_filter=true` (default) skips silent/instrumental gaps.
+- For best control, pass pre-computed `segments` (see Structure-segment mode)
+  to transcribe specific sections and skip `silence` — avoids VAD dropping
+  sung phrases.
 - Increase `WHISPER_BEAM_SIZE` (e.g. `8`) for slightly better quality at a
   speed cost.
 - Set `WHISPER_COMPUTE_TYPE=int8_float16` to roughly halve VRAM usage on

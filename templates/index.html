@@ -14,8 +14,9 @@
     .sub { color: var(--muted); margin-bottom: 24px; font-size: 14px; }
     .card { background: var(--panel); border: 1px solid #232936; border-radius: 12px; padding: 20px; }
     label { display: block; margin: 12px 0 6px; font-size: 13px; color: var(--muted); }
-    input[type=text], select { width: 100%; padding: 10px 12px; background: #0c0f15; color: var(--text);
+    input[type=text], select, textarea { width: 100%; padding: 10px 12px; background: #0c0f15; color: var(--text);
                                border: 1px solid #2a3242; border-radius: 8px; font-size: 14px; }
+    textarea { min-height: 120px; resize: vertical; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
     .row { display: flex; gap: 16px; flex-wrap: wrap; }
     .row > div { flex: 1 1 220px; }
     .checks { display: flex; gap: 18px; margin-top: 8px; font-size: 14px; color: var(--text); }
@@ -58,6 +59,16 @@
           <label><input type="checkbox" name="word_timestamps" /> Word-level timestamps</label>
         </div>
 
+        <label for="segments">Structure segments JSON (optional — overrides VAD; transcribes only these ranges)</label>
+        <textarea id="segments" name="segments" placeholder='{ "segments": [ {"start": 0.0, "end": 12.3, "label": "verse"}, {"start": 216.0, "end": 220.4, "label": "silence"} ] }'></textarea>
+
+        <div class="row">
+          <div>
+            <label for="skip_labels">Labels to skip (comma-separated)</label>
+            <input id="skip_labels" name="skip_labels" type="text" placeholder="silence" value="silence" />
+          </div>
+        </div>
+
         <button id="go" type="submit">Transcribe</button>
         <div id="status" class="status"></div>
       </form>
@@ -97,6 +108,8 @@
       fd.append("initial_prompt", document.getElementById("prompt").value);
       fd.append("vad_filter", form.vad_filter.checked ? "true" : "false");
       fd.append("word_timestamps", form.word_timestamps.checked ? "true" : "false");
+      fd.append("segments", document.getElementById("segments").value);
+      fd.append("skip_labels", document.getElementById("skip_labels").value);
 
       goBtn.disabled = true;
       statusEl.textContent = "Transcribing... (first request may load the model)";
@@ -110,7 +123,10 @@
         if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
 
         const elapsed = ((performance.now() - t0) / 1000).toFixed(2);
-        metaEl.textContent = `language=${data.language} (p=${data.language_probability}) · duration=${data.duration}s · request=${elapsed}s`;
+        let meta = `language=${data.language} (p=${data.language_probability}) · duration=${data.duration}s · request=${elapsed}s`;
+        if (data.mode) meta += ` · mode=${data.mode}`;
+        if (data.ranges) meta += ` · ${data.ranges.length} range(s)`;
+        metaEl.textContent = meta;
         textEl.textContent = data.text;
 
         segmentsEl.innerHTML = "";
