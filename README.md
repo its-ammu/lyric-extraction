@@ -98,6 +98,12 @@ Open `http://<ec2-public-ip>:8000/` (make sure the security group lets port
 | `NOVA_MODEL_ID`         | `amazon.nova-pro-v1:0` | Bedrock Nova model id for `/correct` (`nova-lite`, `nova-micro`, ...) |
 | `NOVA_MAX_TOKENS`       | `4096`       | max output tokens for correction                               |
 | `NOVA_TEMPERATURE`      | `0.2`        | sampling temperature for correction                            |
+| `LYRICS_WEB_SEARCH`     | `1`          | set to `0` to disable Nova's web-search tool                   |
+| `WEB_SEARCH_PROVIDER`   | (auto)       | `tavily`, `serper`, or `duckduckgo` (auto-detected from keys)  |
+| `TAVILY_API_KEY`        | (none)       | enables the Tavily provider (best content for lyrics)          |
+| `SERPER_API_KEY`        | (none)       | enables the Serper (google.serper.dev) provider                |
+| `WEB_SEARCH_MAX_RESULTS`| `5`          | results passed back to the model per search                    |
+| `NOVA_MAX_TOOL_ITERS`   | `4`          | max web-search round-trips before forcing a final answer       |
 
 ## API
 
@@ -175,7 +181,20 @@ curl -X POST http://<ec2-public-ip>:8000/correct \
      -d '{"song_name": "Bohemian Rhapsody — Queen", "lyrics": "is this the real life..."}'
 ```
 
-Response: `{ "song_name": "...", "model": "amazon.nova-pro-v1:0", "corrected": "..." }`
+Response: `{ "song_name": "...", "model": "amazon.nova-pro-v1:0", "corrected": "...", "web_search_provider": "tavily", "searches": ["Golden Brown The Stranglers lyrics"] }`
+
+**Web search grounding:** Nova is given a `web_search` tool (via the Bedrock
+Converse tool-use loop) so it can look up the official lyrics before
+correcting, rather than relying on memory alone. It runs up to
+`NOVA_MAX_TOOL_ITERS` searches, then returns the formatted lyrics. Providers:
+
+- **Tavily** (recommended) — set `TAVILY_API_KEY`. Returns clean page content.
+- **Serper** — set `SERPER_API_KEY` (google.serper.dev). Returns snippets.
+- **DuckDuckGo** — keyless fallback used automatically when no key is set;
+  scrapes the HTML endpoint, so it's best-effort.
+
+Disable entirely with `LYRICS_WEB_SEARCH=0`. The EC2 instance needs outbound
+internet (and the chosen provider's domain reachable) for this to work.
 
 **AWS setup:** the app uses the standard boto3 credential chain — on EC2 give
 the instance role permission to call Bedrock and enable model access for Nova

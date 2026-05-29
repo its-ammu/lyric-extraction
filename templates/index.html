@@ -188,7 +188,12 @@
         const elapsed = ((performance.now() - t0) / 1000).toFixed(2);
         correctedEl.textContent = data.corrected;
         correctedEl.style.display = "block";
-        correctStatusEl.textContent = `Done (model=${data.model}, ${elapsed}s).`;
+        let cmeta = `Done (model=${data.model}, ${elapsed}s`;
+        if (data.searches && data.searches.length) {
+          cmeta += `, ${data.searches.length} web search(es) via ${data.web_search_provider}`;
+        }
+        cmeta += ").";
+        correctStatusEl.textContent = cmeta;
       } catch (err) {
         correctStatusEl.textContent = "Error: " + err.message;
         correctStatusEl.className = "status err";

@@ -49,6 +49,18 @@ NOVA_MODEL_ID = os.environ.get("NOVA_MODEL_ID", "amazon.nova-pro-v1:0")
 NOVA_MAX_TOKENS = int(os.environ.get("NOVA_MAX_TOKENS", "4096"))
 NOVA_TEMPERATURE = float(os.environ.get("NOVA_TEMPERATURE", "0.2"))
 
+# Web search tool (lets Nova look up accurate lyrics while correcting).
+# Provider auto-detects from available keys unless WEB_SEARCH_PROVIDER is set:
+#   tavily (TAVILY_API_KEY) -> serper (SERPER_API_KEY) -> duckduckgo (no key).
+WEB_SEARCH_ENABLED = os.environ.get("LYRICS_WEB_SEARCH", "1") == "1"
+WEB_SEARCH_PROVIDER = os.environ.get("WEB_SEARCH_PROVIDER", "").strip().lower()
+TAVILY_API_KEY = os.environ.get("TAVILY_API_KEY", "")
+SERPER_API_KEY = os.environ.get("SERPER_API_KEY", "")
+WEB_SEARCH_MAX_RESULTS = int(os.environ.get("WEB_SEARCH_MAX_RESULTS", "5"))
+WEB_SEARCH_TIMEOUT = float(os.environ.get("WEB_SEARCH_TIMEOUT", "15"))
+# Max tool-use round-trips before we force Nova to answer.
+NOVA_MAX_TOOL_ITERS = int(os.environ.get("NOVA_MAX_TOOL_ITERS", "4"))
+
 MAX_UPLOAD_MB = int(os.environ.get("MAX_UPLOAD_MB", "200"))
 ALLOWED_EXTENSIONS = {
     "mp3", "wav", "flac", "ogg", "m4a", "aac", "opus", "webm", "mp4", "wma",
@@ -114,12 +126,166 @@ def get_bedrock():
     return _bedrock_client
 
 
+# ---------------------------------------------------------------------------
+# Web search tool (grounding for lyric correction)
+# ---------------------------------------------------------------------------
+def _active_search_provider() -> Optional[str]:
+    """Resolve which search provider to use, or None if web search is off."""
+    if not WEB_SEARCH_ENABLED:
+        return None
+    if WEB_SEARCH_PROVIDER:
+        return WEB_SEARCH_PROVIDER
+    if TAVILY_API_KEY:
+        return "tavily"
+    if SERPER_API_KEY:
+        return "serper"
+    return "duckduckgo"
+
+
+def _format_results(results: list[dict]) -> str:
+    """Render search results (title/url/content dicts) as text for the model."""
+    if not results:
+        return "No results found."
+    blocks = []
+    for r in results[:WEB_SEARCH_MAX_RESULTS]:
+        title = (r.get("title") or "").strip()
+        url = (r.get("url") or "").strip()
+        content = (r.get("content") or "").strip()
+        if len(content) > 1500:
+            content = content[:1500] + "..."
+        blocks.append(f"Title: {title}\nURL: {url}\nContent: {content}")
+    return "\n\n---\n\n".join(blocks)
+
+
+def _search_tavily(query: str) -> list[dict]:
+    import requests
+
+    resp = requests.post(
+        "https://api.tavily.com/search",
+        json={
+            "api_key": TAVILY_API_KEY,
+            "query": query,
+            "search_depth": "advanced",
+            "max_results": WEB_SEARCH_MAX_RESULTS,
+        },
+        timeout=WEB_SEARCH_TIMEOUT,
+    )
+    resp.raise_for_status()
+    data = resp.json()
+    return [
+        {"title": r.get("title"), "url": r.get("url"), "content": r.get("content")}
+        for r in data.get("results", [])
+    ]
+
+
+def _search_serper(query: str) -> list[dict]:
+    import requests
+
+    resp = requests.post(
+        "https://google.serper.dev/search",
+        headers={"X-API-KEY": SERPER_API_KEY, "Content-Type": "application/json"},
+        json={"q": query, "num": WEB_SEARCH_MAX_RESULTS},
+        timeout=WEB_SEARCH_TIMEOUT,
+    )
+    resp.raise_for_status()
+    data = resp.json()
+    return [
+        {"title": r.get("title"), "url": r.get("link"), "content": r.get("snippet")}
+        for r in data.get("organic", [])
+    ]
+
+
+def _search_duckduckgo(query: str) -> list[dict]:
+    """Keyless fallback using DuckDuckGo's HTML endpoint."""
+    import html
+    import re
+
+    import requests
+
+    resp = requests.post(
+        "https://html.duckduckgo.com/html/",
+        data={"q": query},
+        headers={"User-Agent": "Mozilla/5.0 (compatible; lyrics-bot/1.0)"},
+        timeout=WEB_SEARCH_TIMEOUT,
+    )
+    resp.raise_for_status()
+
+    results: list[dict] = []
+    # Each result: <a class="result__a" href="URL">TITLE</a> ... snippet.
+    link_re = re.compile(
+        r'<a[^>]*class="result__a"[^>]*href="(?P<url>[^"]+)"[^>]*>(?P<title>.*?)</a>',
+        re.S,
+    )
+    snippet_re = re.compile(
+        r'<a[^>]*class="result__snippet"[^>]*>(?P<snippet>.*?)</a>', re.S
+    )
+    tag_re = re.compile(r"<[^>]+>")
+
+    titles = link_re.findall(resp.text)
+    snippets = snippet_re.findall(resp.text)
+    for i, (url, title) in enumerate(titles):
+        snippet = snippets[i] if i < len(snippets) else ""
+        results.append({
+            "title": html.unescape(tag_re.sub("", title)).strip(),
+            "url": html.unescape(url).strip(),
+            "content": html.unescape(tag_re.sub("", snippet)).strip(),
+        })
+        if len(results) >= WEB_SEARCH_MAX_RESULTS:
+            break
+    return results
+
+
+def web_search(query: str) -> str:
+    """Run a web search with the active provider and return text for the model."""
+    provider = _active_search_provider()
+    logger.info("web_search(provider=%s, query=%r)", provider, query)
+    try:
+        if provider == "tavily":
+            results = _search_tavily(query)
+        elif provider == "serper":
+            results = _search_serper(query)
+        else:
+            results = _search_duckduckgo(query)
+    except Exception as e:  # surface error to the model instead of crashing
+        logger.warning("web_search failed: %s", e)
+        return f"Web search failed: {e}"
+    return _format_results(results)
+
+
+WEB_SEARCH_TOOL = {
+    "toolSpec": {
+        "name": "web_search",
+        "description": (
+            "Search the web for the official, accurate lyrics of a song. Use "
+            "this to verify words, fill gaps, and confirm section structure. "
+            "Prefer queries like '<song> <artist> lyrics'."
+        ),
+        "inputSchema": {
+            "json": {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "The search query, e.g. 'Golden Brown The Stranglers lyrics'.",
+                    }
+                },
+                "required": ["query"],
+            }
+        },
+    }
+}
+
+
 CORRECTION_SYSTEM_PROMPT = (
     "You are an expert music lyrics editor. You will be given the raw output of "
     "an automatic speech-to-text system applied to a song. That transcription "
     "often contains misheard words, run-on lines, missing words, and "
     "duplicated phrases. Your job is to produce the correct, clean lyrics.\n\n"
     "Rules:\n"
+    "- When a web_search tool is available, USE IT to look up the official "
+    "lyrics of the named song before finalizing. Search '<song> <artist> "
+    "lyrics', then reconcile the transcription against the real lyrics. Trust "
+    "reputable lyrics sources over the noisy transcription.\n"
     "- Use your knowledge of the named song (and artist, if given) to fix "
     "misheard words and restore the real lyrics.\n"
     "- Keep the original language; do not translate.\n"
@@ -151,8 +317,18 @@ CORRECTION_SYSTEM_PROMPT = (
 )
 
 
-def correct_lyrics_with_nova(song_name: str, lyrics: str) -> str:
-    """Send transcribed lyrics to a Bedrock Nova model and return corrected text."""
+def _extract_text(message: dict) -> str:
+    """Join the text blocks of a Converse message."""
+    return "".join(
+        b["text"] for b in message.get("content", []) if "text" in b
+    ).strip()
+
+
+def correct_lyrics_with_nova(song_name: str, lyrics: str) -> tuple[str, list[str]]:
+    """Correct lyrics with a Bedrock Nova model, optionally using web search.
+
+    Returns (corrected_text, search_queries_used).
+    """
     client = get_bedrock()
 
     song_line = (
@@ -166,18 +342,59 @@ def correct_lyrics_with_nova(song_name: str, lyrics: str) -> str:
         f"{lyrics}"
     )
 
+    messages = [{"role": "user", "content": [{"text": user_text}]}]
+    inference_config = {
+        "maxTokens": NOVA_MAX_TOKENS,
+        "temperature": NOVA_TEMPERATURE,
+    }
+    use_tools = _active_search_provider() is not None
+    searches: list[str] = []
+
+    for _ in range(NOVA_MAX_TOOL_ITERS + 1):
+        kwargs = dict(
+            modelId=NOVA_MODEL_ID,
+            system=[{"text": CORRECTION_SYSTEM_PROMPT}],
+            messages=messages,
+            inferenceConfig=inference_config,
+        )
+        if use_tools:
+            kwargs["toolConfig"] = {"tools": [WEB_SEARCH_TOOL]}
+
+        response = client.converse(**kwargs)
+        out_msg = response["output"]["message"]
+        messages.append(out_msg)
+
+        if response.get("stopReason") != "tool_use":
+            return _extract_text(out_msg), searches
+
+        # Run every requested tool and feed the results back to the model.
+        tool_results = []
+        for block in out_msg.get("content", []):
+            tool_use = block.get("toolUse")
+            if not tool_use:
+                continue
+            query = (tool_use.get("input") or {}).get("query", "")
+            if tool_use.get("name") == "web_search":
+                searches.append(query)
+                result_text = web_search(query)
+            else:
+                result_text = f"Unknown tool: {tool_use.get('name')}"
+            tool_results.append({
+                "toolResult": {
+                    "toolUseId": tool_use["toolUseId"],
+                    "content": [{"text": result_text}],
+                }
+            })
+        messages.append({"role": "user", "content": tool_results})
+
+    # Tool budget exhausted: ask once more without tools for a final answer.
     response = client.converse(
         modelId=NOVA_MODEL_ID,
         system=[{"text": CORRECTION_SYSTEM_PROMPT}],
-        messages=[{"role": "user", "content": [{"text": user_text}]}],
-        inferenceConfig={
-            "maxTokens": NOVA_MAX_TOKENS,
-            "temperature": NOVA_TEMPERATURE,
-        },
+        messages=messages,
+        inferenceConfig=inference_config,
     )
-
-    parts = response["output"]["message"]["content"]
-    return "".join(p.get("text", "") for p in parts).strip()
+    return _extract_text(response["output"]["message"]), searches
 
 
 # ---------------------------------------------------------------------------
@@ -484,11 +701,13 @@ def correct():
             "Correcting lyrics with Nova (song=%r, chars=%d, model=%s)",
             song_name, len(lyrics), NOVA_MODEL_ID,
         )
-        corrected = correct_lyrics_with_nova(song_name, lyrics)
+        corrected, searches = correct_lyrics_with_nova(song_name, lyrics)
         return jsonify({
             "song_name": song_name,
             "model": NOVA_MODEL_ID,
             "corrected": corrected,
+            "web_search_provider": _active_search_provider(),
+            "searches": searches,
         })
     except Exception as e:
         logger.exception("Lyric correction failed")
